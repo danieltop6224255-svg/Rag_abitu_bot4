@@ -76,6 +76,16 @@ class QuestionsProcessor:
             })
         return refs
 
+    def _extract_retrieval_chunks(self, retrieval_results: list) -> list:
+        chunks = []
+        for result in retrieval_results:
+            chunks.append({
+                "document_id": result.get("document_id"),
+                "page": result.get("page"),
+                "text": result.get("text")
+            })
+        return chunks
+
     def _validate_page_references(self, claimed_pages: list, retrieval_results: list, min_pages: int = 2, max_pages: int = 8) -> list:
         """
         Validate that all page numbers mentioned in the LLM's answer are actually from the retrieval results.
@@ -137,6 +147,7 @@ class QuestionsProcessor:
         validated_pages = self._validate_page_references(pages, retrieval_results)
         answer_dict["relevant_pages"] = validated_pages
         answer_dict["references"] = self._extract_references(retrieval_results)
+        answer_dict["retrieval_chunks"] = self._extract_retrieval_chunks(retrieval_results)
         return answer_dict
 
     def _get_sub_questions(self, question_text: str) -> list[str]:
@@ -237,6 +248,7 @@ class QuestionsProcessor:
                         "question_text": question_text,
                         "value": None,
                         "references": [],
+                        "retrieval_chunks": [],
                         "error": answer_dict["error"],
                         "answer_details": {"$ref": detail_ref}
                     }
@@ -253,6 +265,7 @@ class QuestionsProcessor:
                     "question_text": question_text,
                     "value": answer_dict.get("final_answer"),
                     "references": answer_dict.get("references", []),
+                    "retrieval_chunks": answer_dict.get("retrieval_chunks", []),
                     "answer_details": {"$ref": detail_ref}
                 }
             else:
@@ -391,6 +404,7 @@ class QuestionsProcessor:
         """Process a complex question by answering sub-questions in parallel and composing a final answer."""
         individual_answers = {}
         aggregated_references = []
+        aggregated_chunks = []
 
         def process_sub_question(sub_question: str) -> tuple[str, dict]:
             answer_dict = self.get_answer_for_query(question=sub_question)
@@ -408,12 +422,18 @@ class QuestionsProcessor:
                 _, answer_dict = sub_question_answer
                 individual_answers[sub_question] = answer_dict
                 aggregated_references.extend(answer_dict.get("references", []))
+                aggregated_chunks.extend(answer_dict.get("retrieval_chunks", []))
 
         unique_refs = {}
         for ref in aggregated_references:
             key = (ref.get("document_id"), ref.get("page_index"))
             unique_refs[key] = ref
         aggregated_references = list(unique_refs.values())
+        unique_chunks = {}
+        for chunk in aggregated_chunks:
+            key = (chunk.get("document_id"), chunk.get("page"), chunk.get("text"))
+            unique_chunks[key] = chunk
+        aggregated_chunks = list(unique_chunks.values())
 
         comparative_answer = self.openai_processor.get_answer_from_rag_context(
             question=question,
@@ -423,4 +443,5 @@ class QuestionsProcessor:
         )
         self.response_data = self.openai_processor.response_data
         comparative_answer["references"] = aggregated_references
+        comparative_answer["retrieval_chunks"] = aggregated_chunks
         return comparative_answer

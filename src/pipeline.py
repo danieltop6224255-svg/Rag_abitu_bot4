@@ -6,6 +6,7 @@ import os
 import json
 import pandas as pd
 import yaml
+import math
 
 from src.pdf_parsing import PDFParser
 from src.parsed_documents_merging import PageTextPreparation
@@ -341,6 +342,82 @@ class Pipeline:
             )
         return similarity_results
 
+    def evaluate_rag_quality(self):
+        """Run one QA pass and evaluate both answer quality and retrieval quality."""
+        processor = QuestionsProcessor(
+            vector_db_dir=self.paths.vector_db_dir,
+            documents_dir=self.paths.documents_dir,
+            questions_file_path=self.paths.questions_file_path,
+            new_challenge_pipeline=True,
+            subset_path=self.paths.subset_path,
+            parent_document_retrieval=self.run_config.parent_document_retrieval,
+            llm_reranking=self.run_config.llm_reranking,
+            llm_reranking_sample_size=self.run_config.llm_reranking_sample_size,
+            top_n_retrieval=self.run_config.top_n_retrieval,
+            parallel_requests=self.run_config.parallel_requests,
+            api_provider=self.run_config.api_provider,
+            answering_model=self.run_config.answering_model,
+            full_context=self.run_config.full_context
+        )
+
+        processing_result = processor.process_all_questions(
+            output_path=self._get_next_available_filename(self.paths.answers_file_path),
+            submission_file=self.run_config.submission_file,
+            pipeline_details=self.run_config.pipeline_details
+        )
+
+        questions = [item.get("q") for item in processor.questions]
+        generated = processing_result.get("questions", [])
+        pipeline_answers = [item.get("value") for item in generated]
+        true_answers = processing_result.get("true_answers", [])
+        retrieval_chunks = [item.get("retrieval_chunks", []) for item in generated]
+
+        api_processor = APIProcessor(provider=self.run_config.api_provider)
+        answer_similarity = api_processor.get_answers_similarity(
+            questions=questions,
+            pipeline_answers=pipeline_answers,
+            true_answers=true_answers,
+            model=self.run_config.answering_model
+        )
+        print("Similarity score counted")
+
+        retrieval_quality = api_processor.calc_chunks_usefulness(
+            questions=questions,
+            true_answers=true_answers,
+            retrieval_results=retrieval_chunks,
+            model=self.run_config.answering_model
+        )
+
+        answer_scores = [item.get("score", 0.0) for item in answer_similarity if item.get("score") is not None]
+        retrieval_usefulness_scores = [item.get("usefulness_scores") for item in retrieval_quality]
+        retrieval_relevance_probabilitys = [item.get("topic_relevance_probabilitys") for item in retrieval_quality]
+
+        retrieval_usefulness = [Pipeline.get_weighted_avg(i) for i in retrieval_usefulness_scores]
+        retrieval_relevance = [Pipeline.get_weighted_avg(i) for i in retrieval_relevance_probabilitys]
+
+
+        print(
+            f"Average answer similarity score: {(sum(answer_scores) / len(answer_scores)) if answer_scores else 0.0:.4f}")
+        print(
+            f"Retrieval usefulness weighted_avg: {(sum(retrieval_usefulness) / len(retrieval_usefulness)) if retrieval_usefulness else 0.0:.4f}")
+        print(
+            f"Retrieval topic relevance weighted_avg: {(sum(retrieval_relevance) / len(retrieval_relevance)) if retrieval_relevance else 0.0:.4f}")
+
+        return {
+            "answer_similarity": answer_similarity,
+            "retrieval_quality": retrieval_quality
+        }
+
+    @staticmethod
+    def get_weighted_avg(scores: list[float]) -> float:
+        scores = [score for score in scores if score is not None]
+        if not scores:
+            return 0
+        s = sum([scores[i] / (math.log2(i + 2)) for i in range(len(scores))])
+        n = sum([1 / (math.log2(i + 2)) for i in range(len(scores))])
+        return s / n
+
+
 
 preprocess_configs = {"ser_tab": RunConfig(use_serialized_tables=True),
                       "no_ser_tab": RunConfig(use_serialized_tables=False)}
@@ -538,4 +615,6 @@ if __name__ == "__main__":
     # Questions processing logic depends on the run_config
     # pipeline.process_questions()
 
-    pipeline.evaluate_answers_similarity()
+    #pipeline.evaluate_answers_similarity()
+
+    pipeline.evaluate_rag_quality()

@@ -345,6 +345,71 @@ True answer:
     system_prompt_with_schema = build_system_prompt(instruction, pydantic_schema=pydantic_schema)
 
 
+class ChunkUsefulnessPrompt:
+    instruction = """
+You are a retrieval quality evaluator for RAG.
+Given a question, true answer, and one retrieved chunk, evaluate:
+1) usefulness of this chunk for producing the true answer;
+2) probability that the chunk is actually about the asked topic.
+
+Return both scores in [0.0, 1.0] with step 0.1 and a short explanation.
+
+Usefulness scale:
+- 0.0 = Useless for answer.
+- 0.1 = Almost useless.
+- 0.2 = Very weakly useful.
+- 0.3 = Slightly useful.
+- 0.4 = Somewhat useful.
+- 0.5 = Moderately useful.
+- 0.6 = Fairly useful.
+- 0.7 = Useful.
+- 0.8 = Very useful.
+- 0.9 = Highly useful.
+- 1.0 = Directly contains key information needed for true answer.
+
+Topic relevance probability scale:
+- 0.0 = Clearly unrelated to question topic.
+- 0.1 = Almost certainly unrelated.
+- 0.2 = Very unlikely related.
+- 0.3 = Weak relation.
+- 0.4 = Partial relation.
+- 0.5 = Uncertain / mixed relation.
+- 0.6 = Likely related.
+- 0.7 = Clearly related.
+- 0.8 = Strongly related.
+- 0.9 = Very strongly related though maybe implicit.
+- 1.0 = Explicitly about asked topic with clear matching entities/metric/timeframe.
+"""
+
+    user_prompt = """
+Question:
+\"\"\"
+{question}
+\"\"\"
+
+True answer:
+\"\"\"
+{true_answer}
+\"\"\"
+
+Retrieved chunk:
+\"\"\"
+{chunk_text}
+\"\"\"
+"""
+
+    class ChunkUsefulnessSchema(BaseModel):
+        usefulness_score: float = Field(description="How useful this chunk is for constructing the true answer, from 0.0 to 1.0.")
+        topic_relevance_probability: float = Field(description="How likely the chunk is about the exact question topic, from 0.0 to 1.0.")
+        explanation: str = Field(description="Short explanation for both scores.")
+
+    pydantic_schema = re.sub(r"^ {4}", "", inspect.getsource(ChunkUsefulnessSchema), flags=re.MULTILINE)
+    system_prompt = build_system_prompt(instruction)
+    system_prompt_with_schema = build_system_prompt(instruction, pydantic_schema=pydantic_schema)
+
+
+
+
 
 
 class RetrievalRankingSingleBlock(BaseModel):

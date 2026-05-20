@@ -500,6 +500,59 @@ class APIProcessor:
             })
         return results
 
+    def calc_chunks_usefulness(
+            self,
+            questions: List[str],
+            true_answers: List[str],
+            retrieval_results: List[List[Dict]],
+            model: Optional[str] = None
+    ) -> List[Dict]:
+        """Evaluate retrieval chunks usefulness and topic relevance via LLM."""
+        if self.provider != "openai":
+            raise NotImplementedError("calc_chunks_usefulness is currently implemented only for openai provider.")
+
+        if not (len(questions) == len(true_answers) == len(retrieval_results)):
+            raise ValueError("questions, true_answers and retrieval_results must have the same length.")
+
+        if model is None:
+            model = self.processor.default_model
+
+        evaluation_results: List[Dict] = []
+        for question, true_answer, chunks in zip(questions, true_answers, retrieval_results):
+            per_chunk = []
+            for chunk in chunks:
+                chunk_text = chunk.get("text", "")
+                eval_dict = self.processor.send_message(
+                    model=model,
+                    system_content=prompts.ChunkUsefulnessPrompt.system_prompt,
+                    human_content=prompts.ChunkUsefulnessPrompt.user_prompt.format(
+                        question=question,
+                        true_answer=true_answer,
+                        chunk_text=chunk_text
+                    ),
+                    is_structured=True,
+                    response_format=prompts.ChunkUsefulnessPrompt.ChunkUsefulnessSchema
+                )
+                per_chunk.append({
+                    "document_id": chunk.get("document_id"),
+                    "page": chunk.get("page"),
+                    "usefulness_score": eval_dict.get("usefulness_score"),
+                    "topic_relevance_probability": eval_dict.get("topic_relevance_probability"),
+                    "explanation": eval_dict.get("explanation")
+                })
+
+            usefulness_scores = [x["usefulness_score"] for x in per_chunk]
+            relevance_scores = [x["topic_relevance_probability"] for x in per_chunk]
+            evaluation_results.append({
+                "question": question,
+                "true_answer": true_answer,
+                "chunks": per_chunk,
+                "usefulness_scores": usefulness_scores,
+                "topic_relevance_probabilitys": relevance_scores
+            })
+
+        return evaluation_results
+
 
 
 
