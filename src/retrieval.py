@@ -10,7 +10,7 @@ import numpy as np
 from dotenv import load_dotenv
 from openai import OpenAI
 
-from src.reranking import LLMReranker
+from src.reranking import LLMReranker, JinaReranker
 
 _log = logging.getLogger(__name__)
 
@@ -143,5 +143,46 @@ class HybridRetriever:
             documents_batch_size=documents_batch_size,
             llm_weight=llm_weight,
         )
+
+        return reranked_results[:top_n]
+
+
+class JinaHybridRetriever:
+    def __init__(self, vector_db_dir: Path):
+        self.vector_retriever = VectorRetriever(vector_db_dir)
+        self.reranker = JinaReranker()
+
+    def retrieve(
+        self,
+        query: str,
+        llm_reranking_sample_size: int = 28,
+        documents_batch_size: int = 2,
+        top_n: int = 6,
+        llm_weight: float = 0.7
+    ) -> List[Dict]:
+        # documents_batch_size and llm_weight are kept for interface compatibility
+        _ = documents_batch_size
+        _ = llm_weight
+
+        vector_results = self.vector_retriever.retrieve(query=query, top_n=llm_reranking_sample_size)
+        if not vector_results:
+            return []
+
+        documents = [doc.get("text", "") for doc in vector_results]
+        jina_response = self.reranker.rerank(query=query, documents=documents, top_n=min(top_n, len(documents)))
+        jina_results = jina_response.get("results", [])
+        print(len(jina_results))
+
+        reranked_results = []
+        for rank_item in jina_results:
+            doc_index = rank_item.get("index")
+            if doc_index is None or doc_index < 0 or doc_index >= len(vector_results):
+                continue
+
+            doc = vector_results[doc_index].copy()
+            relevance_score = round(float(rank_item.get("relevance_score", 0.0)), 4)
+            doc["relevance_score"] = relevance_score
+            doc["combined_score"] = relevance_score
+            reranked_results.append(doc)
 
         return reranked_results[:top_n]

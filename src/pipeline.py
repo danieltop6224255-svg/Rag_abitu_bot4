@@ -7,6 +7,7 @@ import json
 import pandas as pd
 import yaml
 import math
+from dotenv import load_dotenv
 
 from src.pdf_parsing import PDFParser
 from src.parsed_documents_merging import PageTextPreparation
@@ -14,7 +15,7 @@ from src.text_splitter import TextSplitter
 from src.ingestion import VectorDBIngestor
 from src.ingestion import BM25Ingestor
 from src.questions_processing import QuestionsProcessor
-# from src.tables_serialization import TableSerializer
+from src.tables_serialization import TableSerializer
 from src.url_parsing import URLParser
 
 from src.api_requests import APIProcessor
@@ -67,6 +68,7 @@ class RunConfig:
     api_provider: str = "openai"
     answering_model: str = "gpt-4o-mini-2024-07-18"  # or "gpt-4o-2024-08-06"
     config_suffix: str = ""
+    cached_processing_result_file: str = ""
 
 
 class Pipeline:
@@ -130,13 +132,24 @@ class Pipeline:
         )
         print(f"PDF documents parsed and saved to {self.paths.parsed_documents_path}")
 
-    # def serialize_tables(self, max_workers: int = 10):
-    #     """Process tables in parsed documents using parallel threading"""
-    #     serializer = TableSerializer()
-    #     serializer.process_directory_parallel(
-    #         self.paths.parsed_documents_path,
-    #         max_workers=max_workers
-    #     )
+    def serialize_tables(self, max_workers: int = 10):
+        """Process tables in parsed documents using parallel threading"""
+        load_dotenv()
+
+        proxy_pass = os.getenv("PROXY_PASSWORD")
+        proxy_user = os.getenv("PROXY_USERNAME")
+        if not proxy_pass:
+            raise RuntimeError("PROXY_PASSWORD missing")
+        if not proxy_user:
+            raise RuntimeError("PROXY_USERNAME missing")
+
+        os.environ["HTTP_PROXY"] = f"http://{proxy_user}:{proxy_pass}@5.129.219.79:3128"
+        os.environ["HTTPS_PROXY"] = f"http://{proxy_user}:{proxy_pass}@5.129.219.79:3128"
+        serializer = TableSerializer()
+        serializer.process_directory_parallel(
+            self.paths.parsed_documents_path,
+            max_workers=max_workers
+        )
 
     def merge_documents(self):
         """Merge complex JSON documents into a simpler structure with a list of pages, where all text blocks are combined into a single string."""
@@ -312,22 +325,27 @@ class Pipeline:
             full_context=self.run_config.full_context
         )
 
-        processing_result = processor.process_all_questions(
-            output_path=self._get_next_available_filename(self.paths.answers_file_path),
-            submission_file=self.run_config.submission_file,
-            pipeline_details=self.run_config.pipeline_details
-        )
+        if self.run_config.cached_processing_result_file:
+            cached_path = self.paths.root_path / self.run_config.cached_processing_result_file
+            with open(cached_path, "r", encoding="utf-8") as f:
+                processing_result = json.load(f)
+        else:
+            processing_result = processor.process_all_questions(
+                output_path=self._get_next_available_filename(self.paths.answers_file_path),
+                submission_file=self.run_config.submission_file,
+                pipeline_details=self.run_config.pipeline_details
+            )
 
         questions = [item.get("q") for item in processor.questions]
         pipeline_answers = [item.get("value") for item in processing_result.get("questions", [])]
-        true_answers = processing_result.get("true_answers", [])
+        true_answers = processing_result.get("true_answers") or [item.get("a") for item in processor.questions]
 
         api_processor = APIProcessor(provider=self.run_config.api_provider)
         similarity_results = api_processor.get_answers_similarity(
             questions=questions,
             pipeline_answers=pipeline_answers,
             true_answers=true_answers,
-            model=self.run_config.answering_model
+            model="o3-mini-2025-01-31"
         )
 
         scores = [item.get("score", 0.0) for item in similarity_results if item.get("score") is not None]
@@ -360,16 +378,21 @@ class Pipeline:
             full_context=self.run_config.full_context
         )
 
-        processing_result = processor.process_all_questions(
-            output_path=self._get_next_available_filename(self.paths.answers_file_path),
-            submission_file=self.run_config.submission_file,
-            pipeline_details=self.run_config.pipeline_details
-        )
+        if self.run_config.cached_processing_result_file:
+            cached_path = self.paths.root_path / self.run_config.cached_processing_result_file
+            with open(cached_path, "r", encoding="utf-8") as f:
+                processing_result = json.load(f)
+        else:
+            processing_result = processor.process_all_questions(
+                output_path=self._get_next_available_filename(self.paths.answers_file_path),
+                submission_file=self.run_config.submission_file,
+                pipeline_details=self.run_config.pipeline_details
+            )
 
         questions = [item.get("q") for item in processor.questions]
         generated = processing_result.get("questions", [])
         pipeline_answers = [item.get("value") for item in generated]
-        true_answers = processing_result.get("true_answers", [])
+        true_answers = processing_result.get("true_answers") or [item.get("a") for item in processor.questions]
         retrieval_chunks = [item.get("retrieval_chunks", []) for item in generated]
 
         api_processor = APIProcessor(provider=self.run_config.api_provider)
@@ -377,7 +400,7 @@ class Pipeline:
             questions=questions,
             pipeline_answers=pipeline_answers,
             true_answers=true_answers,
-            model=self.run_config.answering_model
+            model="o3-mini-2025-01-31"
         )
         print("Similarity score counted")
 
@@ -385,7 +408,7 @@ class Pipeline:
             questions=questions,
             true_answers=true_answers,
             retrieval_results=retrieval_chunks,
-            model=self.run_config.answering_model
+            model="o3-mini-2025-01-31",
         )
 
         answer_scores = [item.get("score", 0.0) for item in answer_similarity if item.get("score") is not None]
@@ -466,6 +489,35 @@ max_nst_o3m_config = RunConfig(
     config_suffix="_max_nst_o3m"
 )
 
+max_nst_jina_o3m_config = RunConfig(
+    use_serialized_tables=False,
+    parent_document_retrieval=True,
+    llm_reranking=False,
+    parallel_requests=2,
+    pipeline_details="Custom pdf parsing + vDB + Router + Parent Document Retrieval + jina reranking + SO CoT; llm = o3-mini",
+    answering_model="o3-mini-2025-01-31",
+    config_suffix="_max_nst_o3m"
+)
+
+max_nst_o4m_config = RunConfig(
+    use_serialized_tables=False,
+    parent_document_retrieval=True,
+    llm_reranking=True,
+    parallel_requests=25,
+    pipeline_details="Custom pdf parsing + vDB + Router + Parent Document Retrieval + reranking + SO CoT; llm = o4-mini",
+    answering_model="gpt-4o-mini-2024-07-18",
+    config_suffix="_max_nst_o4m"
+)
+
+max_nst_5m_config = RunConfig(
+    use_serialized_tables=False,
+    parent_document_retrieval=True,
+    llm_reranking=True,
+    parallel_requests=25,
+    pipeline_details="Custom pdf parsing + vDB + Router + Parent Document Retrieval + reranking + SO CoT; llm = 5.4-mini",
+    answering_model="gpt-5.4-mini",
+    config_suffix="_max_nst_5m"
+)
 max_st_o3m_config = RunConfig(
     use_serialized_tables=True,
     parent_document_retrieval=True,
@@ -576,7 +628,7 @@ configs = {"base": base_config,
 # You can also change the run_config to try out different configurations
 if __name__ == "__main__":
     root_path = here() / "data" / "test_set"
-    pipeline = Pipeline(root_path, run_config=max_nst_o3m_config)
+    pipeline = Pipeline(root_path, run_config=max_st_o3m_config)
 
     # This method parses pdf reports into a jsons. It creates jsons in the debug/data_01_parsed_reports. These jsons used in the next steps.
     # It also stores raw output of docling in debug/data_01_parsed_reports_debug, these jsons contain a LOT of metadata, and not used anywhere
@@ -586,7 +638,7 @@ if __name__ == "__main__":
 
     # This method should be called only if you want run configs with serialized tables
     # It modifies the jsons in the debug/data_01_parsed_reports, adding a new field "serialized_table" to each table
-    # pipeline.serialize_tables(max_workers=5)
+    pipeline.serialize_tables(max_workers=5)
 
     # This method converts jsons from the debug/data_01_parsed_reports into much simpler jsons, that is a list of pages in markdown
     # New jsons can be found in debug/data_02_merged_reports
@@ -617,4 +669,4 @@ if __name__ == "__main__":
 
     #pipeline.evaluate_answers_similarity()
 
-    pipeline.evaluate_rag_quality()
+    #pipeline.evaluate_rag_quality()

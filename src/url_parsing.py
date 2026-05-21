@@ -8,6 +8,8 @@ from typing import Dict, List, Optional, Union
 from urllib.parse import urlparse
 
 import trafilatura
+from bs4 import BeautifulSoup
+from tabulate import tabulate
 
 logger = logging.getLogger(__name__)
 
@@ -78,16 +80,70 @@ class URLParser:
     def _get_sha1_name(url: str) -> str:
         return hashlib.sha1(url.encode("utf-8")).hexdigest()
 
-    def _build_output_payload(self, url: str, text: str) -> Dict:
+    def _table_to_markdown(self, table_tag) -> str:
+        rows = []
+        for tr in table_tag.find_all("tr"):
+            cells = tr.find_all(["th", "td"])
+            row = [" ".join(cell.stripped_strings) for cell in cells]
+            if row:
+                rows.append(row)
+
+        if not rows:
+            return ""
+
+        max_cols = max(len(row) for row in rows)
+        normalized_rows = [row + [""] * (max_cols - len(row)) for row in rows]
+
+        headers = normalized_rows[0]
+        body = normalized_rows[1:]
+        if not body:
+            body = [[""] * len(headers)]
+
+        return tabulate(body, headers=headers, tablefmt="github")
+
+    def _extract_tables(self, html: str) -> List[Dict]:
+        if not html:
+            return []
+
+        soup = BeautifulSoup(html, "html.parser")
+        extracted_tables = []
+
+        for table_id, table_tag in enumerate(soup.find_all("table")):
+            table_html = str(table_tag)
+            table_markdown = self._table_to_markdown(table_tag)
+            if not table_markdown.strip():
+                continue
+
+            extracted_tables.append({
+                "table_id": table_id,
+                "page": 1,
+                "bbox": [],
+                "#-rows": len(table_tag.find_all("tr")),
+                "#-cols": max((len(row.find_all(["th", "td"])) for row in table_tag.find_all("tr")), default=0),
+                "markdown": table_markdown,
+                "html": table_html,
+                "json": {},
+            })
+
+        return extracted_tables
+
+    def _build_output_payload(self, url: str, text: str, html: Optional[str] = None) -> Dict:
         sha1_name = self._get_sha1_name(url)
+        tables = self._extract_tables(html or "")
+
+        page_content = [{"type": "text", "text": text}]
+        for table in tables:
+            page_content.append({"type": "table", "table_id": table["table_id"]})
 
         return {
             "metainfo": {
                 "sha1_name": sha1_name,
                 "source_type": "url",
                 "url": url,
+                "tables_amount": len(tables),
             },
-            "content": {"chunks": None, "pages": [{"page": 1, "text": text}]},
+            "content": [{"page": 1, "content": page_content}],
+            "tables": tables,
         }
 
     def parse_urls(self, urls: List[Union[str, Dict[str, str]]]) -> None:
@@ -117,7 +173,7 @@ class URLParser:
                 logger.warning("Failed to extract text from %s (skipping)", url)
                 continue
 
-            json_obj = self._build_output_payload(url, extracted_text)
+            json_obj = self._build_output_payload(url, extracted_text, downloaded)
             out_path = self.output_dir / self._safe_filename(url)
 
             with out_path.open("w", encoding="utf-8") as file:

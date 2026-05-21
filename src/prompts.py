@@ -16,62 +16,6 @@ def build_system_prompt(instruction: str = "", example: str = "", pydantic_schem
     return system_prompt
 
 
-class RephrasedQuestionsPrompt:
-    instruction = """
-You are a question rephrasing system.
-Your task is to break down a comparative question into individual questions for each company mentioned.
-Each output question must be self-contained, maintain the same intent and metric as the original question, be specific to the respective company, and use consistent phrasing.
-"""
-
-    class RephrasedQuestion(BaseModel):
-        """Individual question for a company"""
-        company_name: str = Field(description="Company name, exactly as provided in quotes in the original question")
-        question: str = Field(description="Rephrased question specific to this company")
-
-    class RephrasedQuestions(BaseModel):
-        """List of rephrased questions"""
-        questions: List['RephrasedQuestionsPrompt.RephrasedQuestion'] = Field(
-            description="List of rephrased questions for each company")
-
-    pydantic_schema = '''
-class RephrasedQuestion(BaseModel):
-    """Individual question for a company"""
-    company_name: str = Field(description="Company name, exactly as provided in quotes in the original question")
-    question: str = Field(description="Rephrased question specific to this company")
-
-class RephrasedQuestions(BaseModel):
-    """List of rephrased questions"""
-    questions: List['RephrasedQuestionsPrompt.RephrasedQuestion'] = Field(description="List of rephrased questions for each company")
-'''
-
-    example = r"""
-Example:
-Input:
-Original comparative question: 'Which company had higher revenue in 2022, "Apple" or "Microsoft"?'
-Companies mentioned: "Apple", "Microsoft"
-
-Output:
-{
-    "questions": [
-        {
-            "company_name": "Apple",
-            "question": "What was Apple's revenue in 2022?"
-        },
-        {
-            "company_name": "Microsoft", 
-            "question": "What was Microsoft's revenue in 2022?"
-        }
-    ]
-}
-"""
-
-    user_prompt = "Original comparative question: '{question}'\n\nCompanies mentioned: {companies}"
-
-    system_prompt = build_system_prompt(instruction, example)
-
-    system_prompt_with_schema = build_system_prompt(instruction, example, pydantic_schema)
-
-
 class SubQuestionsPrompt:
     instruction = """
 You analyze user questions for decomposition.
@@ -233,6 +177,124 @@ Here is the LLM response that not following the schema and needs to be properly 
 """
 
 
+class AnswersSimilarityPrompt:
+    instruction = """
+You are an evaluator for question answering quality.
+Given a question, a pipeline answer, and a reference (true) answer, evaluate how semantically close the pipeline answer is to the reference.
+
+Rules:
+- Focus on factual correctness and semantic equivalence.
+- Minor phrasing differences should not reduce the score significantly.
+- Penalize incorrect facts, missing key details, or contradictions.
+- If pipeline answer is "N/A" and true answer is available, score should be very low.
+- Return a score from 0.0 to 1.0 and a short explanation.
+
+Scoring scale (use increments of 0.1):
+- 0.0 = Completely incorrect: answer does not match reference meaning at all or is fully contradictory.
+- 0.1 = Almost completely incorrect: only an accidental/vague overlap without useful correctness.
+- 0.2 = Very weak match: tiny fragment is related, most of the meaning is wrong or missing.
+- 0.3 = Weak match: small part is correct, but key facts are incorrect or absent.
+- 0.4 = Limited match: some relevant elements, but substantial factual gaps/errors remain.
+- 0.5 = Partial match: about half of key meaning is correct, with notable omissions/inaccuracies.
+- 0.6 = Fair match: mostly correct direction, but lacks important details or has minor factual issues.
+- 0.7 = Good match: largely correct meaning with only limited omissions/inexactness.
+- 0.8 = Very good match: close to reference, only small non-critical differences.
+- 0.9 = Near-equivalent: almost identical meaning, tiny phrasing/detail differences only.
+- 1.0 = Fully equivalent: semantically the same as the true answer.
+"""
+
+    user_prompt = """
+Question:
+\"\"\"
+{question}
+\"\"\"
+
+Pipeline answer:
+\"\"\"
+{pipeline_answer}
+\"\"\"
+
+True answer:
+\"\"\"
+{true_answer}
+\"\"\"
+"""
+
+    class SimilaritySchema(BaseModel):
+        score: float = Field(description="Semantic correctness score from 0.0 to 1.0.")
+        explanation: str = Field(description="Short justification for the assigned score.")
+
+    pydantic_schema = re.sub(r"^ {4}", "", inspect.getsource(SimilaritySchema), flags=re.MULTILINE)
+    system_prompt = build_system_prompt(instruction)
+    system_prompt_with_schema = build_system_prompt(instruction, pydantic_schema=pydantic_schema)
+
+
+class ChunkUsefulnessSchema(BaseModel):
+    usefulness_score: float = Field(description="How useful this chunk is for constructing the true answer, from 0.0 to 1.0.")
+    topic_relevance_probability: float = Field(description="How likely the chunk is about the exact question topic, from 0.0 to 1.0.")
+    explanation: str = Field(description="Short explanation for both scores.")
+
+
+class ChunkUsefulnessMultipleSchema(BaseModel):
+    chunk_evaluations: List[ChunkUsefulnessSchema] = Field(
+        description="Evaluations for all provided chunks, in the same order as input chunks."
+    )
+
+
+class ChunkUsefulnessPrompt:
+    instruction = """
+You are a retrieval quality evaluator for RAG.
+Given a question, true answer, and one or more retrieved chunks, evaluate for each chunk:
+1) usefulness of this chunk for producing the true answer;
+2) probability that the chunk is actually about the asked topic.
+
+Return both scores in [0.0, 1.0] with step 0.1 and a short explanation.
+
+Usefulness scale:
+- 0.0 = Useless for answer.
+- 0.1 = Almost useless.
+- 0.2 = Very weakly useful.
+- 0.3 = Slightly useful.
+- 0.4 = Somewhat useful.
+- 0.5 = Moderately useful.
+- 0.6 = Fairly useful.
+- 0.7 = Useful.
+- 0.8 = Very useful.
+- 0.9 = Highly useful.
+- 1.0 = Directly contains key information needed for true answer.
+
+Topic relevance probability scale:
+- 0.0 = Clearly unrelated to question topic.
+- 0.1 = Almost certainly unrelated.
+- 0.2 = Very unlikely related.
+- 0.3 = Weak relation.
+- 0.4 = Partial relation.
+- 0.5 = Uncertain / mixed relation.
+- 0.6 = Likely related.
+- 0.7 = Clearly related.
+- 0.8 = Strongly related.
+- 0.9 = Very strongly related though maybe implicit.
+- 1.0 = Explicitly about asked topic with clear matching entities/metric/timeframe.
+"""
+
+    user_prompt = """
+Question:
+\"\"\"
+{question}
+\"\"\"
+
+True answer:
+\"\"\"
+{true_answer}
+\"\"\"
+
+Retrieved chunks:
+{chunks_block}
+"""
+    pydantic_schema = re.sub(r"^ {4}", "", inspect.getsource(ChunkUsefulnessMultipleSchema), flags=re.MULTILINE)
+    system_prompt = build_system_prompt(instruction)
+    system_prompt_with_schema = build_system_prompt(instruction, pydantic_schema=pydantic_schema)
+
 class RerankingPrompt:
     system_prompt_rerank_single_block = """
 You are a RAG (Retrieval-Augmented Generation) retrievals ranker.
@@ -291,126 +353,6 @@ Instructions:
    - Clarity: Be clear and concise in your justifications.
    - No assumptions: Do not infer information beyond what's explicitly stated in the block.
 """
-
-
-class AnswersSimilarityPrompt:
-    instruction = """
-You are an evaluator for question answering quality.
-Given a question, a pipeline answer, and a reference (true) answer, evaluate how semantically close the pipeline answer is to the reference.
-
-Rules:
-- Focus on factual correctness and semantic equivalence.
-- Minor phrasing differences should not reduce the score significantly.
-- Penalize incorrect facts, missing key details, or contradictions.
-- If pipeline answer is "N/A" and true answer is available, score should be very low.
-- Return a score from 0.0 to 1.0 and a short explanation.
-
-Scoring scale (use increments of 0.1):
-- 0.0 = Completely incorrect: answer does not match reference meaning at all or is fully contradictory.
-- 0.1 = Almost completely incorrect: only an accidental/vague overlap without useful correctness.
-- 0.2 = Very weak match: tiny fragment is related, most of the meaning is wrong or missing.
-- 0.3 = Weak match: small part is correct, but key facts are incorrect or absent.
-- 0.4 = Limited match: some relevant elements, but substantial factual gaps/errors remain.
-- 0.5 = Partial match: about half of key meaning is correct, with notable omissions/inaccuracies.
-- 0.6 = Fair match: mostly correct direction, but lacks important details or has minor factual issues.
-- 0.7 = Good match: largely correct meaning with only limited omissions/inexactness.
-- 0.8 = Very good match: close to reference, only small non-critical differences.
-- 0.9 = Near-equivalent: almost identical meaning, tiny phrasing/detail differences only.
-- 1.0 = Fully equivalent: semantically the same as the true answer.
-"""
-
-    user_prompt = """
-Question:
-\"\"\"
-{question}
-\"\"\"
-
-Pipeline answer:
-\"\"\"
-{pipeline_answer}
-\"\"\"
-
-True answer:
-\"\"\"
-{true_answer}
-\"\"\"
-"""
-
-    class SimilaritySchema(BaseModel):
-        score: float = Field(description="Semantic correctness score from 0.0 to 1.0.")
-        explanation: str = Field(description="Short justification for the assigned score.")
-
-    pydantic_schema = re.sub(r"^ {4}", "", inspect.getsource(SimilaritySchema), flags=re.MULTILINE)
-    system_prompt = build_system_prompt(instruction)
-    system_prompt_with_schema = build_system_prompt(instruction, pydantic_schema=pydantic_schema)
-
-
-class ChunkUsefulnessPrompt:
-    instruction = """
-You are a retrieval quality evaluator for RAG.
-Given a question, true answer, and one retrieved chunk, evaluate:
-1) usefulness of this chunk for producing the true answer;
-2) probability that the chunk is actually about the asked topic.
-
-Return both scores in [0.0, 1.0] with step 0.1 and a short explanation.
-
-Usefulness scale:
-- 0.0 = Useless for answer.
-- 0.1 = Almost useless.
-- 0.2 = Very weakly useful.
-- 0.3 = Slightly useful.
-- 0.4 = Somewhat useful.
-- 0.5 = Moderately useful.
-- 0.6 = Fairly useful.
-- 0.7 = Useful.
-- 0.8 = Very useful.
-- 0.9 = Highly useful.
-- 1.0 = Directly contains key information needed for true answer.
-
-Topic relevance probability scale:
-- 0.0 = Clearly unrelated to question topic.
-- 0.1 = Almost certainly unrelated.
-- 0.2 = Very unlikely related.
-- 0.3 = Weak relation.
-- 0.4 = Partial relation.
-- 0.5 = Uncertain / mixed relation.
-- 0.6 = Likely related.
-- 0.7 = Clearly related.
-- 0.8 = Strongly related.
-- 0.9 = Very strongly related though maybe implicit.
-- 1.0 = Explicitly about asked topic with clear matching entities/metric/timeframe.
-"""
-
-    user_prompt = """
-Question:
-\"\"\"
-{question}
-\"\"\"
-
-True answer:
-\"\"\"
-{true_answer}
-\"\"\"
-
-Retrieved chunk:
-\"\"\"
-{chunk_text}
-\"\"\"
-"""
-
-    class ChunkUsefulnessSchema(BaseModel):
-        usefulness_score: float = Field(description="How useful this chunk is for constructing the true answer, from 0.0 to 1.0.")
-        topic_relevance_probability: float = Field(description="How likely the chunk is about the exact question topic, from 0.0 to 1.0.")
-        explanation: str = Field(description="Short explanation for both scores.")
-
-    pydantic_schema = re.sub(r"^ {4}", "", inspect.getsource(ChunkUsefulnessSchema), flags=re.MULTILINE)
-    system_prompt = build_system_prompt(instruction)
-    system_prompt_with_schema = build_system_prompt(instruction, pydantic_schema=pydantic_schema)
-
-
-
-
-
 
 class RetrievalRankingSingleBlock(BaseModel):
     """Rank retrieved text block relevance to a query."""

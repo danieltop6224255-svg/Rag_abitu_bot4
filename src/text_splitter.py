@@ -67,7 +67,7 @@ class TextSplitter():
 
         return token_count
 
-    def _split_page(self, page: Dict[str, any], chunk_size: int = 300, chunk_overlap: int = 50) -> List[Dict[str, any]]:
+    def _split_page(self, page: Dict[str, any], chunk_size: int = 400, chunk_overlap: int = 50) -> List[Dict[str, any]]:
         """Split page text into chunks. The original text includes markdown tables."""
         text_splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
             model_name="gpt-4o",

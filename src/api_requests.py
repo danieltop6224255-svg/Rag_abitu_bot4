@@ -505,7 +505,8 @@ class APIProcessor:
             questions: List[str],
             true_answers: List[str],
             retrieval_results: List[List[Dict]],
-            model: Optional[str] = None
+            model: Optional[str] = None,
+            chunks_batch_size: int = 4
     ) -> List[Dict]:
         """Evaluate retrieval chunks usefulness and topic relevance via LLM."""
         if self.provider != "openai":
@@ -517,29 +518,49 @@ class APIProcessor:
         if model is None:
             model = self.processor.default_model
 
+        if chunks_batch_size < 1:
+            raise ValueError("chunks_batch_size must be >= 1")
+
         evaluation_results: List[Dict] = []
         for question, true_answer, chunks in zip(questions, true_answers, retrieval_results):
             per_chunk = []
-            for chunk in chunks:
-                chunk_text = chunk.get("text", "")
+            chunk_batches = [chunks[i:i + chunks_batch_size] for i in range(0, len(chunks), chunks_batch_size)]
+
+            for batch in chunk_batches:
+                chunks_block = "\n\n---\n\n".join(
+                    [f'Chunk {i + 1}:\n"""\n{chunk.get("text", "")}\n"""' for i, chunk in enumerate(batch)]
+                )
                 eval_dict = self.processor.send_message(
                     model=model,
                     system_content=prompts.ChunkUsefulnessPrompt.system_prompt,
                     human_content=prompts.ChunkUsefulnessPrompt.user_prompt.format(
                         question=question,
                         true_answer=true_answer,
-                        chunk_text=chunk_text
+                        chunks_block=chunks_block
                     ),
                     is_structured=True,
-                    response_format=prompts.ChunkUsefulnessPrompt.ChunkUsefulnessSchema
+                    response_format=prompts.ChunkUsefulnessMultipleSchema
                 )
-                per_chunk.append({
-                    "document_id": chunk.get("document_id"),
-                    "page": chunk.get("page"),
-                    "usefulness_score": eval_dict.get("usefulness_score"),
-                    "topic_relevance_probability": eval_dict.get("topic_relevance_probability"),
-                    "explanation": eval_dict.get("explanation")
-                })
+                chunk_evaluations = eval_dict.get("chunk_evaluations", [])
+                if len(chunk_evaluations) < len(batch):
+                    print("missing LLM chunk evaluation response")
+                    chunk_evaluations.extend([
+                        {
+                            "usefulness_score": 0.0,
+                            "topic_relevance_probability": 0.0,
+                            "explanation": "Default evaluation due to missing LLM response"
+                        }
+                        for _ in range(len(batch) - len(chunk_evaluations))
+                    ])
+
+                for chunk, chunk_eval in zip(batch, chunk_evaluations):
+                    per_chunk.append({
+                        "document_id": chunk.get("document_id"),
+                        "page": chunk.get("page"),
+                        "usefulness_score": chunk_eval.get("usefulness_score"),
+                        "topic_relevance_probability": chunk_eval.get("topic_relevance_probability"),
+                        "explanation": chunk_eval.get("explanation")
+                    })
 
             usefulness_scores = [x["usefulness_score"] for x in per_chunk]
             relevance_scores = [x["topic_relevance_probability"] for x in per_chunk]
@@ -663,9 +684,25 @@ class AsyncOpenaiProcessor:
                 except json.JSONDecodeError as e:
                     print(f"[ERROR] Line {line_number}: Failed to load JSON from line: {raw_line}")
                     continue
+                metadata = result[2] if len(result) > 2 and isinstance(result[2], dict) else {
+                    "original_index": line_number - 1}
+
+                # Failed requests are stored as [request_json, [errors...], metadata]
+                if not isinstance(result[1], dict):
+                    print(f"[ERROR] Line {line_number}: request failed, raw errors: {result[1]}")
+                    results.append({
+                        'index': metadata,
+                        'question': result[0].get('messages', []),
+                        'answer': {
+                            'subject_core_entities_list': [],
+                            'relevant_headers_list': [],
+                            'information_blocks': []
+                        }
+                    })
+                    continue
 
                 # Check finish_reason in the API response
-                finish_reason = result[1]['choices'][0].get('finish_reason', '')
+                finish_reason = result[1].get('choices', [{}])[0].get('finish_reason', '')
                 if finish_reason != "stop":
                     print(f"[WARNING] Line {line_number}: finish_reason is '{finish_reason}' (expected 'stop').")
 
@@ -676,11 +713,15 @@ class AsyncOpenaiProcessor:
                     answer = response_format(**answer_parsed).model_dump()
                 except Exception as e:
                     print(f"[ERROR] Line {line_number}: Failed to parse answer JSON. Error: {e}.")
-                    answer = ""
+                    answer = {
+                        'subject_core_entities_list': [],
+                        'relevant_headers_list': [],
+                        'information_blocks': []
+                    }
 
                 results.append({
-                    'index': result[2],
-                    'question': result[0]['messages'],
+                    'index': metadata,
+                    'question': result[0].get('messages', []),
                     'answer': answer
                 })
             

@@ -3,7 +3,7 @@ from typing import Union, Dict, List, Optional
 import re
 import yaml
 from pathlib import Path
-from src.retrieval import VectorRetriever, HybridRetriever
+from src.retrieval import VectorRetriever, HybridRetriever, JinaHybridRetriever
 from src.api_requests import APIProcessor
 from tqdm import tqdm
 import threading
@@ -130,8 +130,12 @@ class QuestionsProcessor:
                 top_n=self.top_n_retrieval,
             )
         else:
-            retriever = VectorRetriever(vector_db_dir=self.vector_db_dir)
-            retrieval_results = retriever.retrieve(query=question, top_n=self.top_n_retrieval)
+            retriever = JinaHybridRetriever(vector_db_dir=self.vector_db_dir)
+            retrieval_results = retriever.retrieve(
+                query=question,
+                llm_reranking_sample_size=self.llm_reranking_sample_size,
+                top_n=self.top_n_retrieval,
+            )
 
         if not retrieval_results:
             raise ValueError("No relevant context found")

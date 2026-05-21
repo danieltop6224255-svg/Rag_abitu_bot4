@@ -8,6 +8,17 @@ from concurrent.futures import ThreadPoolExecutor
 
 class JinaReranker:
     def __init__(self):
+        load_dotenv()
+
+        proxy_pass = os.getenv("PROXY_PASSWORD")
+        proxy_user = os.getenv("PROXY_USERNAME")
+        if not proxy_pass:
+            raise RuntimeError("PROXY_PASSWORD missing")
+        if not proxy_user:
+            raise RuntimeError("PROXY_USERNAME missing")
+
+        os.environ["HTTP_PROXY"] = f"http://{proxy_user}:{proxy_pass}@5.129.219.79:3128"
+        os.environ["HTTPS_PROXY"] = f"http://{proxy_user}:{proxy_pass}@5.129.219.79:3128"
         self.url = 'https://api.jina.ai/v1/rerank'
         self.headers = self.get_headers()
         
