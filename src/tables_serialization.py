@@ -333,6 +333,7 @@ class TableSerializer(BaseOpenaiProcessor):
 
         process_messages()
         self.logger.info("Table serialization completed!")
+        process_messages()
 
 
 class TableSerialization:
