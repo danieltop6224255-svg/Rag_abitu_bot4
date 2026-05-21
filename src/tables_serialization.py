@@ -205,23 +205,32 @@ class TableSerializer(BaseOpenaiProcessor):
             results_filepath: str = './temp_async_llm_results.jsonl'
     ) -> dict:
         """Process all tables in the report asynchronously without temp JSONL files."""
+        _ = requests_filepath, results_filepath  # kept for backward-compatible signature
         tables = json_report.get("tables", [])
         if not tables:
             self.logger.info("No tables found in report; skipping table serialization.")
             return json_report
 
         max_parallel_tables = 5
+        table_timeout_seconds = 180
         semaphore = asyncio.Semaphore(max_parallel_tables)
 
         async def _worker(table_index: int):
             async with semaphore:
                 try:
-                    serialized = await asyncio.to_thread(
-                        self._serialize_table,
-                        json_report,
-                        table_index
+                    serialized = await asyncio.wait_for(
+                        asyncio.to_thread(
+                            self._serialize_table,
+                            json_report,
+                            table_index
+                        ),
+                        timeout=table_timeout_seconds
                     )
                     return table_index, serialized, None
+                except asyncio.TimeoutError:
+                    return table_index, None, TimeoutError(
+                        f"table {table_index} timed out after {table_timeout_seconds} seconds"
+                    )
                 except Exception as exc:
                     return table_index, None, exc
 
@@ -262,11 +271,17 @@ class TableSerializer(BaseOpenaiProcessor):
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             try:
-                updated_report = loop.run_until_complete(self.async_serialize_tables(
-                    json_report,
-                    requests_filepath=requests_filepath,
-                    results_filepath=results_filepath
-                ))
+                file_timeout_seconds = 1800
+                updated_report = loop.run_until_complete(
+                    asyncio.wait_for(
+                        self.async_serialize_tables(
+                            json_report,
+                            requests_filepath=requests_filepath,
+                            results_filepath=results_filepath
+                        ),
+                        timeout=file_timeout_seconds
+                    )
+                )
             finally:
                 loop.close()
                 try:
@@ -309,11 +324,14 @@ class TableSerializer(BaseOpenaiProcessor):
                     smoothing=0.3
             ) as pbar:
                 futures = []
+                future_to_file = {}
                 for json_file in json_files:
                     future = executor.submit(self.process_file, json_file)
                     future.add_done_callback(lambda p: pbar.update(1))
                     futures.append(future)
+                    future_to_file[future] = json_file.name
 
+                last_progress_ts = time.time()
                 while futures:
                     process_messages()
 
@@ -326,8 +344,20 @@ class TableSerializer(BaseOpenaiProcessor):
                             except Exception as e:
                                 self.logger.error(str(e))
 
+                    if done_futures:
+                        last_progress_ts = time.time()
+
                     for future in done_futures:
                         futures.remove(future)
+                        future_to_file.pop(future, None)
+
+                    if time.time() - last_progress_ts > 60:
+                        stuck_files = sorted(set(future_to_file.get(f, "<unknown>") for f in futures))
+                        self.logger.warning(
+                            "No completed files for 60s. Still running: %s",
+                            ", ".join(stuck_files)
+                        )
+                        last_progress_ts = time.time()
 
                     time.sleep(0.1)
 
