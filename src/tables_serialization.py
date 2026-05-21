@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 from typing import Optional, List, Union, Literal
 from pydantic import BaseModel, Field
 from openai import OpenAI
-from src.api_requests import BaseOpenaiProcessor, AsyncOpenaiProcessor
+from src.api_requests import BaseOpenaiProcessor
 import tiktoken
 from tqdm import tqdm
 import logging
@@ -204,46 +204,41 @@ class TableSerializer(BaseOpenaiProcessor):
             requests_filepath: str = './temp_async_llm_requests.jsonl',
             results_filepath: str = './temp_async_llm_results.jsonl'
     ) -> dict:
-        """Process all tables in the report asynchronously"""
-        queries = []
-        table_indices = []
+        """Process all tables in the report asynchronously without temp JSONL files."""
+        _ = requests_filepath, results_filepath  # kept for backward-compatible signature
+        tables = json_report.get("tables", [])
+        if not tables:
+            self.logger.info("No tables found in report; skipping table serialization.")
+            return json_report
 
-        for idx, table in enumerate(json_report["tables"]):
-            table_index = self._resolve_table_id(table, idx)
-            table_indices.append(table_index)
+        max_parallel_tables = 5
+        table_timeout_seconds = 180
+        semaphore = asyncio.Semaphore(max_parallel_tables)
 
-            context_before, context_after = self._get_table_context(json_report, table_index)
-            table_info = next(
-                (table for table in json_report["tables"] if self._resolve_table_id(table, -1) == table_index),
-                None
-            )
-            table_content = table_info.get("html", "") if isinstance(table_info, dict) else ""
+        async def _worker(table_index: int):
+            async with semaphore:
+                try:
+                    serialized = await asyncio.wait_for(
+                        asyncio.to_thread(
+                            self._serialize_table,
+                            json_report,
+                            table_index
+                        ),
+                        timeout=table_timeout_seconds
+                    )
+                    return table_index, serialized, None
+                except asyncio.TimeoutError:
+                    return table_index, None, TimeoutError(
+                        f"table {table_index} timed out after {table_timeout_seconds} seconds"
+                    )
+                except Exception as exc:
+                    return table_index, None, exc
 
-            # Construct the query
-            query = ""
-            if context_before:
-                query += f'Here is additional text before the table that might be relevant (or not):\n"""{context_before}"""\n\n'
-            query += f'Here is a table in HTML format:\n"""{table_content}"""'
-            if context_after:
-                query += f'\n\nHere is additional text after the table that might be relevant (or not):\n"""{context_after}"""'
+        table_indices = [self._resolve_table_id(table, idx) for idx, table in enumerate(tables)]
+        tasks = [asyncio.create_task(_worker(table_index)) for table_index in table_indices]
+        results = await asyncio.gather(*tasks)
 
-            queries.append(query)
-
-        results = await AsyncOpenaiProcessor().process_structured_ouputs_requests(
-            model='gpt-4o-mini-2024-07-18',
-            temperature=0,
-            system_content=TableSerialization.system_prompt,
-            queries=queries,
-            response_format=TableSerialization.TableBlocksCollection,
-            preserve_requests=False,
-            preserve_results=False,
-            logging_level=20,
-            requests_filepath=requests_filepath,
-            save_filepath=results_filepath,
-        )
-
-        # Add results back to json_report
-        for table_index, result in zip(table_indices, results):
+        for table_index, serialized, error in results:
             table_info = next(
                 (table for table in json_report["tables"] if self._resolve_table_id(table, -1) == table_index),
                 None
@@ -252,22 +247,15 @@ class TableSerializer(BaseOpenaiProcessor):
                 self.logger.warning(f"Skipping merge: table {table_index} not found")
                 continue
 
-            new_table = {}
-            for key, value in table_info.items():
-                new_table[key] = value
-                if key == "html":
-                    answer = result.get("answer") if isinstance(result, dict) else None
-                    if not isinstance(answer, dict):
-                        answer = {
-                            "subject_core_entities_list": [],
-                            "relevant_headers_list": [],
-                            "information_blocks": []
-                        }
-                    new_table["serialized"] = answer
+            if error is not None:
+                self.logger.error("Serialization failed for table %s: %s", table_index, error)
+                serialized = {
+                    "subject_core_entities_list": [],
+                    "relevant_headers_list": [],
+                    "information_blocks": []
+                }
 
-            for i, table in enumerate(json_report["tables"]):
-                if self._resolve_table_id(table, i) == table_index:
-                    json_report["tables"][i] = new_table
+            table_info["serialized"] = serialized
 
         return json_report
 
@@ -283,11 +271,17 @@ class TableSerializer(BaseOpenaiProcessor):
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             try:
-                updated_report = loop.run_until_complete(self.async_serialize_tables(
-                    json_report,
-                    requests_filepath=requests_filepath,
-                    results_filepath=results_filepath
-                ))
+                file_timeout_seconds = 1800
+                updated_report = loop.run_until_complete(
+                    asyncio.wait_for(
+                        self.async_serialize_tables(
+                            json_report,
+                            requests_filepath=requests_filepath,
+                            results_filepath=results_filepath
+                        ),
+                        timeout=file_timeout_seconds
+                    )
+                )
             finally:
                 loop.close()
                 try:
@@ -330,11 +324,14 @@ class TableSerializer(BaseOpenaiProcessor):
                     smoothing=0.3
             ) as pbar:
                 futures = []
+                future_to_file = {}
                 for json_file in json_files:
                     future = executor.submit(self.process_file, json_file)
                     future.add_done_callback(lambda p: pbar.update(1))
                     futures.append(future)
+                    future_to_file[future] = json_file.name
 
+                last_progress_ts = time.time()
                 while futures:
                     process_messages()
 
@@ -347,13 +344,26 @@ class TableSerializer(BaseOpenaiProcessor):
                             except Exception as e:
                                 self.logger.error(str(e))
 
+                    if done_futures:
+                        last_progress_ts = time.time()
+
                     for future in done_futures:
                         futures.remove(future)
+                        future_to_file.pop(future, None)
+
+                    if time.time() - last_progress_ts > 60:
+                        stuck_files = sorted(set(future_to_file.get(f, "<unknown>") for f in futures))
+                        self.logger.warning(
+                            "No completed files for 60s. Still running: %s",
+                            ", ".join(stuck_files)
+                        )
+                        last_progress_ts = time.time()
 
                     time.sleep(0.1)
 
         process_messages()
         self.logger.info("Table serialization completed!")
+        process_messages()
 
 
 class TableSerialization:
