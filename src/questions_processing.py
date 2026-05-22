@@ -25,8 +25,10 @@ class QuestionsProcessor:
         parallel_requests: int = 10,
         api_provider: str = "openai",
         answering_model: str = "gpt-4o-2024-08-06",
-        full_context: bool = False
+        full_context: bool = False,
+        is_chat_bot: bool = False
     ):
+        self.is_chat_bot = is_chat_bot
         self.questions = self._load_questions(questions_file_path)
         self.documents_dir = Path(documents_dir)
         self.vector_db_dir = Path(vector_db_dir)
@@ -48,6 +50,8 @@ class QuestionsProcessor:
         self._lock = threading.Lock()
 
     def _load_questions(self, questions_file_path: Optional[Union[str, Path]]) -> List[Dict[str, str]]:
+        if self.is_chat_bot:
+            return []
         if questions_file_path is None:
             return []
         qas_text = questions_file_path.read_text(encoding="utf-8")
