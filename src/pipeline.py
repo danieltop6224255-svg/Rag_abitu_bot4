@@ -69,6 +69,7 @@ class RunConfig:
     answering_model: str = "gpt-4o-mini-2024-07-18"  # or "gpt-4o-2024-08-06"
     config_suffix: str = ""
     cached_processing_result_file: str = ""
+    is_chat_bot: bool = False
 
 
 class Pipeline:
@@ -76,6 +77,7 @@ class Pipeline:
                  pdf_reports_dir_name: str = "pdf_docs", run_config: RunConfig = RunConfig()):
         self.run_config = run_config
         self.paths = self._initialize_paths(root_path, subset_name, questions_file_name, pdf_reports_dir_name)
+        self._chat_questions_processor = None
 
     def _initialize_paths(self, root_path: Path, subset_name: str, questions_file_name: str,
                           pdf_reports_dir_name: str) -> PipelineConfig:
@@ -297,6 +299,8 @@ class Pipeline:
             api_provider=self.run_config.api_provider,
             answering_model=self.run_config.answering_model,
             full_context=self.run_config.full_context
+            ,
+            is_chat_bot=self.run_config.is_chat_bot
         )
 
         output_path = self._get_next_available_filename(self.paths.answers_file_path)
@@ -323,6 +327,8 @@ class Pipeline:
             api_provider=self.run_config.api_provider,
             answering_model=self.run_config.answering_model,
             full_context=self.run_config.full_context
+            ,
+            is_chat_bot=self.run_config.is_chat_bot
         )
 
         if self.run_config.cached_processing_result_file:
@@ -376,6 +382,8 @@ class Pipeline:
             api_provider=self.run_config.api_provider,
             answering_model=self.run_config.answering_model,
             full_context=self.run_config.full_context
+            ,
+            is_chat_bot=self.run_config.is_chat_bot
         )
 
         if self.run_config.cached_processing_result_file:
@@ -430,6 +438,49 @@ class Pipeline:
             "answer_similarity": answer_similarity,
             "retrieval_quality": retrieval_quality
         }
+
+    def answer_question(self, question: str, messages_context: list[str] | None = None) -> tuple[str, list[dict]]:
+        """
+        Answer a single chat question using RAG.
+        Currently uses only the latest message text as a question.
+        Returns (answer_text, references) so references can be appended in future.
+        """
+        if not question or not question.strip():
+            return "Пожалуйста, напиши вопрос по поступлению во ВШЭ.", []
+
+        if self._chat_questions_processor is None:
+            self._chat_questions_processor = QuestionsProcessor(
+                vector_db_dir=self.paths.vector_db_dir,
+                documents_dir=self.paths.documents_dir,
+                questions_file_path=None,
+                new_challenge_pipeline=True,
+                subset_path=self.paths.subset_path,
+                parent_document_retrieval=self.run_config.parent_document_retrieval,
+                llm_reranking=self.run_config.llm_reranking,
+                llm_reranking_sample_size=self.run_config.llm_reranking_sample_size,
+                top_n_retrieval=self.run_config.top_n_retrieval,
+                parallel_requests=1,
+                api_provider=self.run_config.api_provider,
+                answering_model=self.run_config.answering_model,
+                full_context=self.run_config.full_context,
+                is_chat_bot=True
+            )
+
+        answer_dict = self._chat_questions_processor.process_question(question)
+        answer_text = answer_dict.get("final_answer") or "Не удалось получить ответ. Попробуй переформулировать вопрос."
+        references = answer_dict.get("references", [])
+
+        log_path = self.paths.root_path / "chat_bot_answers.jsonl"
+        with open(log_path, "a", encoding="utf-8") as log_file:
+            log_line = {
+                "question": question,
+                "answer": answer_text,
+                "references": references,
+                "messages_context": messages_context or [question]
+            }
+            log_file.write(json.dumps(log_line, ensure_ascii=False) + "\n")
+
+        return answer_text, references
 
     @staticmethod
     def get_weighted_avg(scores: list[float]) -> float:
